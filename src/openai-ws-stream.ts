@@ -99,14 +99,16 @@ type WsOptions = SimpleStreamOptions & {
 };
 
 // Keep the advertised Pi 0.80.x API working while accepting Pi 1.x transcripts.
-const transcriptApi = piAi as unknown as {
+type TranscriptApi = {
   normalizeContext?: (context: Context) => Context;
   getCurrentSystemPrompt?: (messages: Message[]) => string;
   getCurrentTools?: (messages: Message[]) => Context["tools"];
 };
 
-function normalizeContext(context: Context): Context {
-  return transcriptApi.normalizeContext?.(context) ?? context;
+const transcriptApi = piAi as unknown as TranscriptApi;
+
+function normalizeContext(context: Context, api: TranscriptApi = transcriptApi): Context {
+  return api.normalizeContext?.(context) ?? context;
 }
 
 function applyServiceTierPricing(
@@ -791,13 +793,14 @@ async function fallbackToHttpResponses(
 
 export function createOpenAIWebSocketStreamFn(
   managerOptions: OpenAIWebSocketManagerOptions = {},
+  api: TranscriptApi = transcriptApi,
 ): StreamFunction {
   return (model, transcript, options) => {
-    const normalized = normalizeContext(transcript);
-    const context: Context = transcriptApi.getCurrentSystemPrompt && transcriptApi.getCurrentTools
+    const normalized = normalizeContext(transcript, api);
+    const context: Context = api.getCurrentSystemPrompt && api.getCurrentTools
       ? {
-          systemPrompt: transcriptApi.getCurrentSystemPrompt(normalized.messages),
-          tools: transcriptApi.getCurrentTools(normalized.messages),
+          systemPrompt: api.getCurrentSystemPrompt(normalized.messages),
+          tools: api.getCurrentTools(normalized.messages),
           messages: normalized.messages.filter((message) => (message as { role: string }).role !== "system"),
         }
       : normalized;
