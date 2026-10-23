@@ -6,6 +6,7 @@
  * input replay.
  */
 import { randomUUID } from "node:crypto";
+import * as piAi from "@earendil-works/pi-ai";
 import {
   calculateCost,
   createAssistantMessageEventStream,
@@ -39,6 +40,7 @@ import {
   type OpenAIWebSocketEvent,
   type OpenAIWebSocketManagerOptions,
   type ResponseObject,
+  type OutputItem,
 } from "./openai-ws-connection.ts";
 import {
   buildAssistantMessage,
@@ -95,6 +97,17 @@ type WsOptions = SimpleStreamOptions & {
   reasoningSummary?: "auto" | "concise" | "detailed" | null;
   text?: Record<string, unknown>;
 };
+
+// Keep the advertised Pi 0.80.x API working while accepting Pi 1.x transcripts.
+const transcriptApi = piAi as unknown as {
+  normalizeContext?: (context: Context) => Context;
+  getCurrentSystemPrompt?: (messages: Message[]) => string;
+  getCurrentTools?: (messages: Message[]) => Context["tools"];
+};
+
+function normalizeContext(context: Context): Context {
+  return transcriptApi.normalizeContext?.(context) ?? context;
+}
 
 function applyServiceTierPricing(
   usage: Usage,
@@ -246,7 +259,10 @@ function responseFromEvent(event: OpenAIWebSocketEvent): ResponseObject | undefi
 
 function eventString(event: OpenAIWebSocketEvent, key: string): string | undefined {
   const value = (event as Record<string, unknown>)[key];
-  return typeof value === "string" ? value : undefined;
+  if (typeof value === "string") return value;
+  const nested = (event as { error?: Record<string, unknown> }).error;
+  const detail = nested?.[key] ?? (key === "code" ? nested?.type : undefined);
+  return typeof detail === "string" ? detail : undefined;
 }
 
 function encodeAssistantTextSignature(params: {
@@ -757,7 +773,7 @@ async function fallbackToHttp(
       return chained ?? nextPayload;
     },
   } satisfies SimpleStreamOptions | undefined;
-  const httpStream = streamSimpleOpenAIResponses(model, context, mergedOptions);
+  const httpStream = streamSimpleOpenAIResponses(model, normalizeContext(context), mergedOptions);
   for await (const event of httpStream) {
     eventStream.push(event);
   }
@@ -776,7 +792,15 @@ async function fallbackToHttpResponses(
 export function createOpenAIWebSocketStreamFn(
   managerOptions: OpenAIWebSocketManagerOptions = {},
 ): StreamFunction {
-  return (model, context, options) => {
+  return (model, transcript, options) => {
+    const normalized = normalizeContext(transcript);
+    const context: Context = transcriptApi.getCurrentSystemPrompt && transcriptApi.getCurrentTools
+      ? {
+          systemPrompt: transcriptApi.getCurrentSystemPrompt(normalized.messages),
+          tools: transcriptApi.getCurrentTools(normalized.messages),
+          messages: normalized.messages.filter((message) => (message as { role: string }).role !== "system"),
+        }
+      : normalized;
     const eventStream = createEventStream();
 
     queueMicrotask(() => {
@@ -917,6 +941,7 @@ export function createOpenAIWebSocketStreamFn(
 
         const capturedContextLength = context.messages.length;
         let textStarted = false;
+        const completedItems = new Map<number, OutputItem>();
         await new Promise<void>((resolve, reject) => {
           const abortHandler = () => {
             cleanup();
@@ -941,7 +966,12 @@ export function createOpenAIWebSocketStreamFn(
           };
 
           const unsubscribe = session.manager.onMessage((event: OpenAIWebSocketEvent) => {
-            if (event.type === "response.completed") {
+            if (event.type === "response.output_item.done") {
+              const item = event.item;
+              if (typeof event.output_index === "number" && item && typeof item === "object") {
+                completedItems.set(event.output_index, item as OutputItem);
+              }
+            } else if (event.type === "response.completed") {
               const response = responseFromEvent(event);
               if (!response) {
                 cleanup();
@@ -950,8 +980,13 @@ export function createOpenAIWebSocketStreamFn(
               }
               cleanup();
               session.lastContextLength = capturedContextLength;
+              // Some Responses routes omit output from the terminal event.
+              // Final item events contain the complete text and tool arguments.
+              const output = response.output.length > 0
+                ? response.output
+                : [...completedItems].sort(([a], [b]) => a - b).map(([, item]) => item);
               const assistantMsg = buildAssistantMessageFromResponse(
-                response,
+                { ...response, output },
                 model,
                 typedOptions?.serviceTier,
               );

@@ -88,7 +88,7 @@ On compaction, the extension requests Responses compaction v2 through `/v1/respo
 
 For direct `openai/*` models between compactions, the extension also:
 
-- Patches requests with `store: true` and `context_management`
+- Adds `context_management` and defaults unspecified `store` to `true`; preserves an explicit `store: false` for routes that require it
 - Uses `previous_response_id` for live continuation when safe
 - Provides a WebSocket-backed transport path with HTTP fallback
 
@@ -115,7 +115,7 @@ Remote compaction history is only replayed for compatible models. Cross-model tu
 
 Users should be aware:
 
-- For direct `openai/*` models, the extension sets `store: true` on requests, meaning OpenAI retains conversation data server-side
+- For direct `openai/*` models, requests without an explicit storage setting default to `store: true`, meaning OpenAI retains conversation data server-side. An explicit `store: false` is preserved
 - Conversation context is sent to OpenAI's Responses compaction protocol
 - Returned opaque compaction artifacts are stored in Pi's local session JSONL
 - These artifacts are provider-native and not human-readable

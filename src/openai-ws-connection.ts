@@ -239,6 +239,7 @@ export class OpenAIWebSocketManager extends EventEmitter {
     this.send({
       type: "response.create",
       generate: false,
+      store: false,
       model: params.model,
       ...(params.tools ? { tools: params.tools } : {}),
       ...(params.instructions ? { instructions: params.instructions } : {}),
