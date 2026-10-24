@@ -23,6 +23,7 @@ async function scenario(name) {
   const handlers = new Map();
   extension({ registerProvider() {}, on: (name, handler) => handlers.set(name, handler) });
   const httpOnly = name.startsWith("http-continuation");
+  const modern = name === "http-continuation-system";
   const switchToHttp = name.startsWith("sse-switch") || name.startsWith("idle-http");
   let staleId;
   let rejectedReconnect;
@@ -112,7 +113,11 @@ async function scenario(name) {
   const sessionId = crypto.randomUUID();
   const stream = createOpenAIWebSocketStreamFn({
     url: `ws://127.0.0.1:${server.address().port}`, maxRetries: 1, backoffDelaysMs: [1],
-  });
+  }, modern ? {
+    normalizeContext: (context) => context,
+    getCurrentSystemPrompt: (messages) => messages.find((message) => message.role === "system")?.content,
+    getCurrentTools: () => [],
+  } : undefined);
   const options = {
     apiKey: "test-only", sessionId, transport: httpOnly ? "sse" : name === "expired-http-fallback" || name.startsWith("idle-http") ? "auto" : "websocket", openaiWsWarmup: name === "warmup",
     onPayload: (payload) => {
@@ -136,7 +141,10 @@ async function scenario(name) {
     return originalFetch(`http://127.0.0.1:${httpServer.address().port}/v1/responses`, init);
   };
   try {
-    const messages = [user("Remember a fact")];
+    const messages = [
+      ...(modern ? [{ role: "system", content: "System guard", toolsAdded: [], timestamp: 0 }] : []),
+      user("Remember a fact"),
+    ];
     const first = await stream(model, { messages }, { ...options, signal: AbortSignal.timeout(3000) }).result();
     assert.equal(first.stopReason, name === "tool" ? "toolUse" : "stop");
     const ctx = { cwd: process.cwd(), model, hasUI: false, sessionManager: {
@@ -226,6 +234,6 @@ async function scenario(name) {
     await new Promise((resolve) => httpServer.close(resolve));
   }
 }
-for (const name of ["idle-http", "sse-switch", "sse-switch-stale-hook", "sse-switch-mutating-stale-hook", "http-continuation", "http-continuation-empty", "healthy", "tool", "empty", "warmup", "expired-http-fallback", "explicit-reconnect", "auto-reconnect", "expired", "expired-close",
+for (const name of ["idle-http", "sse-switch", "sse-switch-stale-hook", "sse-switch-mutating-stale-hook", "http-continuation", "http-continuation-system", "http-continuation-empty", "healthy", "tool", "empty", "warmup", "expired-http-fallback", "explicit-reconnect", "auto-reconnect", "expired", "expired-close",
   "expired-code", "expired-after-text", "expired-after-tool-start", "retry-fails"]
   .filter((name) => !process.argv[2] || name === process.argv[2])) await scenario(name);

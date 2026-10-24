@@ -75,7 +75,8 @@ function getBranchMessages(branchEntries: BranchEntry[]): AgentMessage[] {
 }
 
 function getBranchMessageCount(branchEntries: BranchEntry[]): number {
-  return branchEntries.filter((entry) => entry.type === "message" && Boolean(entry.message)).length;
+  // Match the non-system transcript used when slicing HTTP continuation input.
+  return getBranchMessages(branchEntries).filter((message) => (message as { role: string }).role !== "system").length;
 }
 
 function getBranchThinkingLevel(branchEntries: BranchEntry[]): string | undefined {
