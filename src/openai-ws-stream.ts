@@ -639,9 +639,7 @@ export function selectInputItemsForContinuation(params: {
 
   if (previousResponseId && session.lastContextLength > 0) {
     const newMessages = context.messages.slice(session.lastContextLength);
-    if (newMessages.length > 0) {
-      return convertMessagesToInputItems(newMessages, model);
-    }
+    return convertMessagesToInputItems(newMessages, model);
   }
 
   return buildFullInput(context, model);
@@ -809,6 +807,14 @@ export function createOpenAIWebSocketStreamFn(
     const eventStream = createEventStream();
     let retriedWithoutPrevious = false;
     let streamStarted = false;
+    const pushEvent = eventStream.push.bind(eventStream);
+    eventStream.push = (event) => {
+      if (event.type === "start") {
+        if (streamStarted) return;
+        streamStarted = true;
+      }
+      pushEvent(event);
+    };
 
     queueMicrotask(() => {
       const run = async () => {
@@ -938,17 +944,14 @@ export function createOpenAIWebSocketStreamFn(
           return await fallbackToHttpResponses(model, context, options, eventStream, signal);
         }
 
-        if (!streamStarted) {
-          streamStarted = true;
-          eventStream.push({
-            type: "start",
-            partial: buildAssistantMessageWithZeroUsage({
-              model: modelInfo,
-              content: [],
-              stopReason: "stop",
-            }),
-          });
-        }
+        eventStream.push({
+          type: "start",
+          partial: buildAssistantMessageWithZeroUsage({
+            model: modelInfo,
+            content: [],
+            stopReason: "stop",
+          }),
+        });
 
         const capturedContextLength = context.messages.length;
         let textStarted = false;
@@ -994,7 +997,7 @@ export function createOpenAIWebSocketStreamFn(
                 return;
               }
               cleanup();
-              session.lastContextLength = capturedContextLength;
+              session.lastContextLength = capturedContextLength + 1;
               // Some Responses routes omit output from the terminal event.
               // Final item events contain the complete text and tool arguments.
               const output = response.output.length > 0

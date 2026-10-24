@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { createOpenAIWebSocketStreamFn, releaseAllWsSessions, releaseWsSession } from "../src/openai-ws-stream.ts";
 import { getContinuationState } from "../src/state.ts";
@@ -17,7 +18,23 @@ const model = {
 const user = (text) => ({ role: "user", content: [{ type: "text", text }], timestamp: 1 });
 
 async function scenario(name) {
-  const server = new WebSocketServer({ port: 0 });
+  const httpRequests = [];
+  const httpServer = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    httpRequests.push(JSON.parse(body));
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    const completed = { type: "response.completed", response: {
+      id: "resp_http", status: "completed", output: [],
+      usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
+    } };
+    response.end(`event: response.completed\ndata: ${JSON.stringify(completed)}\n\n`);
+  });
+  await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
+  let handshakes = 0;
+  const server = new WebSocketServer({ port: 0,
+    verifyClient: () => ++handshakes === 1 || name !== "expired-http-fallback",
+  });
   await once(server, "listening");
   const requests = [];
   let connections = 0;
@@ -60,8 +77,10 @@ async function scenario(name) {
         return;
       }
       socket.send(JSON.stringify({ type: "response.completed", response: {
-        id: `resp_${requests.length}`, output: [{ type: "message", id: "msg_test", role: "assistant",
-          content: [{ type: "output_text", text: "OK" }] }],
+        id: `resp_${requests.length}`, output: name === "tool" && requests.length === 1
+          ? [{ type: "function_call", id: "fc_test", call_id: "call_test", name: "probe", arguments: "{}" }]
+          : [{ type: "message", id: "msg_test", role: "assistant",
+            content: [{ type: "output_text", text: "OK" }] }],
       } }));
       if (name === "auto-reconnect" && connection === 1) setImmediate(() => socket.close());
     });
@@ -71,7 +90,7 @@ async function scenario(name) {
     url: `ws://127.0.0.1:${server.address().port}`, maxRetries: 1, backoffDelaysMs: [1],
   });
   const options = {
-    apiKey: "test-only", sessionId, transport: "websocket", openaiWsWarmup: name === "warmup",
+    apiKey: "test-only", sessionId, transport: name === "expired-http-fallback" ? "auto" : "websocket", openaiWsWarmup: name === "warmup",
     onPayload: (payload) => ({
       ...applyPayloadPatch({ payload, model, cfg: loadConfig("/tmp"),
         previousResponseId: getContinuationState(sessionId)?.responseId }),
@@ -79,15 +98,24 @@ async function scenario(name) {
       store: true, context_management: [{ type: "compaction", compact_threshold: 100 }],
     }),
   };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (url, init) => {
+    assert.equal(String(url), "https://api.openai.com/v1/responses");
+    return originalFetch(`http://127.0.0.1:${httpServer.address().port}/v1/responses`, init);
+  };
   try {
     const messages = [user("Remember a fact")];
     const first = await stream(model, { messages }, { ...options, signal: AbortSignal.timeout(3000) }).result();
-    assert.equal(first.stopReason, "stop");
+    assert.equal(first.stopReason, name === "tool" ? "toolUse" : "stop");
     if (name === "explicit-reconnect") releaseWsSession(sessionId);
     if (name === "auto-reconnect") await Promise.race([
       reconnect, new Promise((_, reject) => setTimeout(() => reject(Error("reconnect timeout")), 3000).unref()),
     ]);
-    const secondStream = stream(model, { messages: [...messages, first, user("Recall it")] },
+    const nextMessages = name === "tool"
+      ? [{ role: "toolResult", toolCallId: first.content[0].id, toolName: "probe",
+          content: [{ type: "text", text: "tool result" }], isError: false, timestamp: 2 }]
+      : name === "empty" ? [] : [user("Recall it")];
+    const secondStream = stream(model, { messages: [...messages, first, ...nextMessages] },
       { ...options, signal: AbortSignal.timeout(3000) });
     const events = [];
     for await (const event of secondStream) events.push(event);
@@ -101,9 +129,18 @@ async function scenario(name) {
       assert.equal(requests.length, partial ? 2 : 3, "retry must be bounded and never replay partial output");
     } else {
       assert.equal(second.stopReason, "stop", second.errorMessage);
-      if (name === "healthy" || name === "warmup") {
+      if (name === "expired-http-fallback") {
+        assert.equal(requests.length, 2);
+        assert.ok(handshakes >= 2);
+        assert.equal(httpRequests.length, 1);
+        assert.equal(httpRequests[0].previous_response_id, undefined);
+        assert.equal(httpRequests[0].input.length, 3);
+      } else if (["healthy", "warmup", "tool", "empty"].includes(name)) {
         assert.equal(requests.length, name === "warmup" ? 3 : 2);
         assert.equal(requests.at(-1).payload.previous_response_id, name === "warmup" ? "resp_2" : "resp_1");
+        assert.deepEqual(requests.at(-1).payload.input, name === "tool"
+          ? [{ type: "function_call_output", call_id: "call_test", output: "tool result" }]
+          : name === "empty" ? [] : [{ type: "message", role: "user", content: "Recall it" }]);
       } else {
         assert.equal(requests.at(-1).connection, 2);
         assert.equal(requests.at(-1).payload.previous_response_id, undefined);
@@ -113,10 +150,12 @@ async function scenario(name) {
     }
     console.log(`PASS ${name}`);
   } finally {
+    globalThis.fetch = originalFetch;
     releaseAllWsSessions();
     for (const socket of server.clients) socket.terminate();
     await new Promise((resolve) => server.close(resolve));
+    await new Promise((resolve) => httpServer.close(resolve));
   }
 }
-for (const name of ["healthy", "warmup", "explicit-reconnect", "auto-reconnect", "expired", "expired-close",
+for (const name of ["healthy", "tool", "empty", "warmup", "expired-http-fallback", "explicit-reconnect", "auto-reconnect", "expired", "expired-close",
   "expired-code", "expired-after-text", "expired-after-tool-start", "retry-fails"]) await scenario(name);
