@@ -1,5 +1,32 @@
 # Validation
 
+## Pipeline-head Luna verification — 2026-10-24
+
+Tested revision: `ca941e06f11a21e7e4ec82fa4573ef09976c068f`, using
+Pi 1.2.0 and `gpt-6-luna` with high reasoning. Both isolated lifecycle
+scripts exited 0. Existing credentials were supplied through runtime provider
+registration, without refresh, persistent import, or global configuration changes.
+
+- **Codex:** the remote trigger returned HTTP 200 and a persisted encrypted
+  `responses_compaction_v2` artifact. The codename was absent from the portable
+  summary and retained plaintext, yet post-compaction recall succeeded. The
+  persisted session independently confirmed a subsequent real `read` tool result;
+  a new process recovered both the codename and file sentinel.
+- **Direct OpenAI WebSocket:** HTTP 101, streamed text with empty terminal output,
+  a real `read` call, injected invalid-ID rejection followed by fresh-socket
+  full-history replay, and saved-session process resume all passed.
+
+The direct channel's previously observed trigger rejection was not retried.
+Codex artifact evidence exercises its built-in transport and does not establish
+custom WebSocket continuity across remote compaction. This focused test phase
+did not run the full suite, static analysis, or delivery phases.
+
+Local evidence is retained under
+`/Users/stan/.no-mistakes/evidence/01M5P36SF92SVJE654BS7CGH4T/round4/`:
+`result.json`, each channel's `lifecycle.log` and isolated session files,
+plus Codex `wire-structure.jsonl`, `compact-result.json`, and
+`post-compaction-tool-proof.json`. These are local evidence, not bundled PR assets.
+
 ## WebSocket repair validation — 2026-10-24
 
 These checks used Node 24.20.0 and Pi CLI 1.2.0 in isolated sessions with only
