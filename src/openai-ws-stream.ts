@@ -53,6 +53,7 @@ import {
 } from "./remote-compaction.ts";
 import {
   getContinuationState,
+  clearContinuationState,
   getRemoteCompactionState,
   setContinuationState,
 } from "./state.ts";
@@ -228,6 +229,7 @@ function getModelDescriptor(model: { api: string; provider: string; id: string }
 
 export function releaseWsSession(sessionId: string | undefined): void {
   if (!sessionId) return;
+  clearContinuationState(sessionId);
   const session = wsRegistry.get(sessionId);
   if (!session) return;
   try {
@@ -805,6 +807,8 @@ export function createOpenAIWebSocketStreamFn(
         }
       : normalized;
     const eventStream = createEventStream();
+    let retriedWithoutPrevious = false;
+    let streamStarted = false;
 
     queueMicrotask(() => {
       const run = async () => {
@@ -884,7 +888,6 @@ export function createOpenAIWebSocketStreamFn(
         }
 
         const remoteCompactionState = getRemoteCompactionState(sessionId);
-        const continuationState = getContinuationState(sessionId);
         const typedOptions = options as WsOptions | undefined;
         const functionTools = convertTools(context.tools);
         const requestKey = buildWsRequestKey({
@@ -898,13 +901,9 @@ export function createOpenAIWebSocketStreamFn(
           remoteCompactionState && remoteCompactionState.modelKey === currentModelKey
             ? undefined
             : incrementalAllowed
-              ? session.manager.previousResponseId ??
-                (continuationState?.modelKey === currentModelKey ? continuationState.responseId : undefined)
+              ? session.manager.previousResponseId ?? undefined
               : undefined;
-        const baselineContextLength =
-          continuationState?.modelKey === currentModelKey && typeof continuationState.contextLength === "number"
-            ? continuationState.contextLength
-            : session.lastContextLength;
+        const baselineContextLength = session.lastContextLength;
         const inputItems = selectInputItemsForContinuation({
           context,
           model,
@@ -923,7 +922,13 @@ export function createOpenAIWebSocketStreamFn(
           options: typedOptions,
         });
 
-        const nextPayload = (await options?.onPayload?.(payload, model)) ?? payload;
+        const nextPayload = { ...((await options?.onPayload?.(payload, model)) ?? payload) } as Record<string, unknown>;
+        // Hooks also serve HTTP requests. Enforce this transport's contract last.
+        nextPayload.store = false;
+        delete nextPayload.context_management;
+        // Continuation IDs belong to the live socket, never to HTTP or an old socket.
+        if (prevResponseId) nextPayload.previous_response_id = prevResponseId;
+        else delete nextPayload.previous_response_id;
         try {
           session.manager.send(nextPayload as Parameters<OpenAIWebSocketManager["send"]>[0]);
           session.lastRequestKey = requestKey;
@@ -933,17 +938,21 @@ export function createOpenAIWebSocketStreamFn(
           return await fallbackToHttpResponses(model, context, options, eventStream, signal);
         }
 
-        eventStream.push({
-          type: "start",
-          partial: buildAssistantMessageWithZeroUsage({
-            model: modelInfo,
-            content: [],
-            stopReason: "stop",
-          }),
-        });
+        if (!streamStarted) {
+          streamStarted = true;
+          eventStream.push({
+            type: "start",
+            partial: buildAssistantMessageWithZeroUsage({
+              model: modelInfo,
+              content: [],
+              stopReason: "stop",
+            }),
+          });
+        }
 
         const capturedContextLength = context.messages.length;
         let textStarted = false;
+        let outputStarted = false;
         const completedItems = new Map<number, OutputItem>();
         await new Promise<void>((resolve, reject) => {
           const abortHandler = () => {
@@ -969,6 +978,9 @@ export function createOpenAIWebSocketStreamFn(
           };
 
           const unsubscribe = session.manager.onMessage((event: OpenAIWebSocketEvent) => {
+            if (event.type.startsWith("response.output_item.") ||
+                event.type === "response.output_text.delta" ||
+                event.type === "response.function_call_arguments.delta") outputStarted = true;
             if (event.type === "response.output_item.done") {
               const item = event.item;
               if (typeof event.output_index === "number" && item && typeof item === "object") {
@@ -1011,6 +1023,20 @@ export function createOpenAIWebSocketStreamFn(
                 ),
               );
             } else if (event.type === "error") {
+              const message = eventString(event, "message") ?? "";
+              const code = eventString(event, "code");
+              if (!retriedWithoutPrevious && !outputStarted &&
+                  typeof nextPayload.previous_response_id === "string" &&
+                  (code === "previous_response_not_found" ||
+                    (code === "invalid_request_error" && /previous_response_id/.test(message)))) {
+                retriedWithoutPrevious = true;
+                cleanup();
+                releaseWsSession(sessionId);
+                // The backend may close immediately after rejecting the ID.
+                // Replay once on a fresh socket, before exposing any output.
+                void run().then(resolve, reject);
+                return;
+              }
               cleanup();
               reject(
                 new Error(

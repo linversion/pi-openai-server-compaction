@@ -1,5 +1,60 @@
 # Validation
 
+## WebSocket repair validation — 2026-10-24
+
+These checks used Node 24.20.0 and Pi CLI 1.2.0 in isolated sessions with only
+this checkout's extension loaded. The declared Pi 0.80.9 development dependencies
+were retained for `npm test`; this change does not claim a complete Pi 1.x migration.
+
+**Direct OpenAI, `openai/gpt-6-luna`, high reasoning, existing subscription-sharing OAuth:**
+
+- HTTP 101 WebSocket upgrade with `store: false`, streamed text and a persisted
+  final reply, including terminal responses whose `output` array was empty.
+- A real `read` tool round trip. Injecting an invalid `previous_response_id`
+  produced a real backend rejection, then a fresh authenticated connection and
+  successful full-history replay without an assistant error.
+- Saved-session resume in a new Pi process preserved the test codename and file
+  contents. This direct-provider resume check did not follow remote compaction.
+- Remote compaction was **not supported on this tested channel**: a minimal
+  request with one user message returned HTTP 200; adding only the trailing
+  `compaction_trigger` returned HTTP 400 with
+  `subscription_sharing_unsupported_capability`. The full lifecycle attempt
+  returned only a portable text summary, which the test correctly rejected as
+  remote-compaction evidence.
+
+**Codex, `openai-codex/gpt-6-luna`, high reasoning, existing Codex client login:**
+
+- A separate isolated run used the existing same-account access token through
+  Pi's supported runtime provider registration. No login, credential refresh,
+  persistent import, global configuration change, or installed-extension change
+  was performed.
+- The request to `https://chatgpt.com/backend-api/codex/responses` returned HTTP
+  200 and an encrypted `compaction` item. The session persisted
+  `details.remoteCompaction.implementation: "responses_compaction_v2"`.
+- The exact test codename was absent from both the portable text summary and
+  retained plaintext history. The first post-compaction answer recovered it.
+- A subsequent real `read` tool round trip returned the file sentinel and
+  codename; a new Pi process resumed the saved session and recalled both.
+
+The Codex run exercises the built-in Codex transport and this extension's remote
+compaction/replay path. It does **not** establish that the direct OpenAI OAuth
+channel accepts triggers or that the custom WebSocket path has passed a remote
+compaction boundary on that channel.
+
+**Automated regression checks:** `npm test` passes typechecking, smoke tests,
+eight output/context checks and ten local WebSocket continuation scenarios.
+These cover explicit no-store handling, streamed text/tool item recovery,
+nested errors, modern/legacy context adaptation, warmup input, same-socket
+continuation, explicit/automatic reconnect, rejected-ID recovery with and without
+socket close, bounded retry, no retry after text/tool output, and exactly one
+logical stream start and terminal event. A new stream-lifecycle assertion failed
+before its fix (`2 !== 1` starts during recovery), then passed. Earlier output
+and transport-boundary tests also failed against upstream main before applying
+the repair. Local fixtures do not substitute for the separate live results above.
+
+Azure, maximum reasoning effort, a full Pi 1.x SDK migration, and direct-provider
+post-remote-compaction continuity were not validated by this repair.
+
 ## Current Responses compaction v2 validation
 
 The full live Pi RPC suite passes with both:
