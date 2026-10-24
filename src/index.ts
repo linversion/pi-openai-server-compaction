@@ -307,8 +307,10 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
     const responseId = extractAssistantResponseId(event.message);
     if (!responseId) return;
 
+    const previous = getContinuationState(sessionId);
     setContinuationState(sessionId, {
       responseId,
+      transport: previous?.responseId === responseId ? previous.transport : "http",
       modelKey: modelKey(model),
       updatedAt: Date.now(),
       contextLength: getBranchMessageCount(ctx.sessionManager.getBranch() as BranchEntry[]),
@@ -351,7 +353,7 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
 
     const continuation = getContinuationState(sessionId);
     const previousResponseId =
-      remoteState === undefined && continuation && continuation.modelKey === modelKey(model)
+      remoteState === undefined && continuation && continuation.transport !== "websocket" && continuation.modelKey === modelKey(model)
         ? continuation.responseId
         : undefined;
 

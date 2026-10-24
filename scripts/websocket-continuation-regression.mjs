@@ -3,7 +3,8 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { createOpenAIWebSocketStreamFn, releaseAllWsSessions, releaseWsSession } from "../src/openai-ws-stream.ts";
-import { getContinuationState } from "../src/state.ts";
+import extension from "../src/index.ts";
+import { getContinuationState, clearContinuationState } from "../src/state.ts";
 import { applyPayloadPatch } from "../src/openai.ts";
 import { loadConfig } from "../src/config.ts";
 
@@ -19,6 +20,13 @@ const user = (text) => ({ role: "user", content: [{ type: "text", text }], times
 
 async function scenario(name) {
   const httpRequests = [];
+  const handlers = new Map();
+  extension({ registerProvider() {}, on: (name, handler) => handlers.set(name, handler) });
+  const httpOnly = name.startsWith("http-continuation");
+  const switchToHttp = name.startsWith("sse-switch") || name.startsWith("idle-http");
+  let staleId;
+  let rejectedReconnect;
+  const reconnectRejected = new Promise((resolve) => { rejectedReconnect = resolve; });
   const httpServer = createServer(async (request, response) => {
     let body = "";
     for await (const chunk of request) body += chunk;
@@ -33,7 +41,14 @@ async function scenario(name) {
   await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
   let handshakes = 0;
   const server = new WebSocketServer({ port: 0,
-    verifyClient: () => ++handshakes === 1 || name !== "expired-http-fallback",
+    verifyClient: () => {
+      handshakes++;
+      if (handshakes > 1 && (name === "expired-http-fallback" || name.startsWith("idle-http"))) {
+        rejectedReconnect();
+        return false;
+      }
+      return true;
+    },
   });
   await once(server, "listening");
   const requests = [];
@@ -82,7 +97,9 @@ async function scenario(name) {
           : [{ type: "message", id: "msg_test", role: "assistant",
             content: [{ type: "output_text", text: "OK" }] }],
       } }));
-      if (name === "auto-reconnect" && connection === 1) setImmediate(() => socket.close());
+      if ((name === "auto-reconnect" || name.startsWith("idle-http")) && connection === 1) {
+        setImmediate(() => socket.close());
+      }
     });
   });
   const sessionId = crypto.randomUUID();
@@ -90,13 +107,21 @@ async function scenario(name) {
     url: `ws://127.0.0.1:${server.address().port}`, maxRetries: 1, backoffDelaysMs: [1],
   });
   const options = {
-    apiKey: "test-only", sessionId, transport: name === "expired-http-fallback" ? "auto" : "websocket", openaiWsWarmup: name === "warmup",
-    onPayload: (payload) => ({
-      ...applyPayloadPatch({ payload, model, cfg: loadConfig("/tmp"),
-        previousResponseId: getContinuationState(sessionId)?.responseId }),
-      // Deliberately emulate an HTTP-oriented hook to exercise the final boundary.
-      store: true, context_management: [{ type: "compaction", compact_threshold: 100 }],
-    }),
+    apiKey: "test-only", sessionId, transport: httpOnly ? "sse" : name === "expired-http-fallback" || name.startsWith("idle-http") ? "auto" : "websocket", openaiWsWarmup: name === "warmup",
+    onPayload: (payload) => {
+      const patched = {
+        ...applyPayloadPatch({ payload, model, cfg: loadConfig("/tmp"),
+          previousResponseId: staleId ?? getContinuationState(sessionId)?.responseId }),
+        ...(staleId ? { input: [] } : {}),
+        // Deliberately emulate an HTTP-oriented hook to exercise the final boundary.
+        store: true, context_management: [{ type: "compaction", compact_threshold: 100 }],
+      };
+      if (name.includes("mutating")) {
+        Object.assign(payload, patched);
+        return;
+      }
+      return patched;
+    },
   };
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (url, init) => {
@@ -107,6 +132,22 @@ async function scenario(name) {
     const messages = [user("Remember a fact")];
     const first = await stream(model, { messages }, { ...options, signal: AbortSignal.timeout(3000) }).result();
     assert.equal(first.stopReason, name === "tool" ? "toolUse" : "stop");
+    const ctx = { cwd: process.cwd(), model, hasUI: false, sessionManager: {
+      getSessionId: () => sessionId,
+      getBranch: () => [...messages, first].map((message) => ({ type: "message", message })),
+    } };
+    handlers.get("message_end")({ message: first }, ctx);
+    assert.equal(getContinuationState(sessionId)?.transport, httpOnly ? "http" : "websocket");
+    const hooked = handlers.get("before_provider_request")({ payload: { model: model.id, input: [] } }, ctx);
+    assert.equal(hooked.previous_response_id, httpOnly ? "resp_http" : undefined);
+    if (name.endsWith("stale-hook")) {
+      staleId = getContinuationState(sessionId).responseId;
+      releaseWsSession(sessionId);
+      assert.equal(getContinuationState(sessionId), undefined);
+    }
+    if (name.startsWith("idle-http")) await Promise.race([
+      reconnectRejected, new Promise((_, reject) => setTimeout(() => reject(Error("disconnect timeout")), 3000).unref()),
+    ]);
     if (name === "explicit-reconnect") releaseWsSession(sessionId);
     if (name === "auto-reconnect") await Promise.race([
       reconnect, new Promise((_, reject) => setTimeout(() => reject(Error("reconnect timeout")), 3000).unref()),
@@ -114,9 +155,9 @@ async function scenario(name) {
     const nextMessages = name === "tool"
       ? [{ role: "toolResult", toolCallId: first.content[0].id, toolName: "probe",
           content: [{ type: "text", text: "tool result" }], isError: false, timestamp: 2 }]
-      : name === "empty" ? [] : [user("Recall it")];
+      : name === "empty" || name === "http-continuation-empty" ? [] : [user("Recall it")];
     const secondStream = stream(model, { messages: [...messages, first, ...nextMessages] },
-      { ...options, signal: AbortSignal.timeout(3000) });
+      { ...options, ...(name.startsWith("sse-switch") ? { transport: "sse" } : {}), signal: AbortSignal.timeout(3000) });
     const events = [];
     for await (const event of secondStream) events.push(event);
     const second = await secondStream.result();
@@ -129,7 +170,26 @@ async function scenario(name) {
       assert.equal(requests.length, partial ? 2 : 3, "retry must be bounded and never replay partial output");
     } else {
       assert.equal(second.stopReason, "stop", second.errorMessage);
-      if (name === "expired-http-fallback") {
+      if (httpOnly) {
+        assert.equal(requests.length, 0);
+        assert.equal(httpRequests.length, 2);
+        assert.equal(httpRequests[1].previous_response_id, "resp_http");
+        assert.deepEqual(httpRequests[1].input, name === "http-continuation-empty"
+          ? [] : [{ type: "message", role: "user", content: "Recall it" }]);
+      } else if (switchToHttp) {
+        assert.equal(requests.length, 1);
+        assert.equal(httpRequests.length, 1);
+        assert.equal(httpRequests[0].previous_response_id, undefined);
+        assert.deepEqual(httpRequests[0].input.map((item) => ({
+          role: item.role,
+          text: typeof item.content === "string" ? item.content : item.content.map((part) => part.text).join(""),
+        })), [
+          { role: "user", text: "Remember a fact" },
+          { role: "assistant", text: "OK" },
+          { role: "user", text: "Recall it" },
+        ]);
+        assert.equal(getContinuationState(sessionId), undefined);
+      } else if (name === "expired-http-fallback") {
         assert.equal(requests.length, 2);
         assert.ok(handshakes >= 2);
         assert.equal(httpRequests.length, 1);
@@ -152,10 +212,11 @@ async function scenario(name) {
   } finally {
     globalThis.fetch = originalFetch;
     releaseAllWsSessions();
+    clearContinuationState(sessionId);
     for (const socket of server.clients) socket.terminate();
     await new Promise((resolve) => server.close(resolve));
     await new Promise((resolve) => httpServer.close(resolve));
   }
 }
-for (const name of ["healthy", "tool", "empty", "warmup", "expired-http-fallback", "explicit-reconnect", "auto-reconnect", "expired", "expired-close",
+for (const name of ["idle-http", "sse-switch", "sse-switch-stale-hook", "sse-switch-mutating-stale-hook", "http-continuation", "http-continuation-empty", "healthy", "tool", "empty", "warmup", "expired-http-fallback", "explicit-reconnect", "auto-reconnect", "expired", "expired-close",
   "expired-code", "expired-after-text", "expired-after-tool-start", "retry-fails"]) await scenario(name);

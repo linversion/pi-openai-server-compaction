@@ -64,7 +64,6 @@ type WsSession = {
   lastContextLength: number;
   lastRequestKey?: string;
   warmUpAttempted: boolean;
-  broken: boolean;
 };
 
 const wsRegistry = new Map<string, WsSession>();
@@ -229,7 +228,7 @@ function getModelDescriptor(model: { api: string; provider: string; id: string }
 
 export function releaseWsSession(sessionId: string | undefined): void {
   if (!sessionId) return;
-  clearContinuationState(sessionId);
+  if (getContinuationState(sessionId)?.transport === "websocket") clearContinuationState(sessionId);
   const session = wsRegistry.get(sessionId);
   if (!session) return;
   try {
@@ -745,34 +744,35 @@ async function fallbackToHttp(
   signal?: AbortSignal,
 ): Promise<void> {
   const sessionId = options?.sessionId;
+  releaseWsSession(sessionId);
   const remoteCompactionState = sessionId ? getRemoteCompactionState(sessionId) : undefined;
   const continuationState = sessionId ? getContinuationState(sessionId) : undefined;
   const originalOnPayload = options?.onPayload;
   const mergedOptions = {
     ...(signal ? { ...options, signal } : options),
     onPayload: async (payload: unknown, payloadModel: Model<any>) => {
-      let nextPayload = payload;
-      if (payload && typeof payload === "object") {
-        const payloadObj = { ...(payload as Record<string, unknown>) };
-        if (remoteCompactionState && remoteCompactionState.modelKey === modelKey(model)) {
-          payloadObj.input = normalizeResponseItemsForPrompt(remoteCompactionState.explicitHistory, model) as unknown[];
-          delete payloadObj.previous_response_id;
-          nextPayload = payloadObj;
-        } else if (
-          typeof payloadObj.previous_response_id === "string" &&
+      const chained = await originalOnPayload?.(payload, payloadModel);
+      const nextPayload = chained ?? payload;
+      if (!nextPayload || typeof nextPayload !== "object") return nextPayload;
+      const payloadObj = { ...(nextPayload as Record<string, unknown>) };
+      if (remoteCompactionState && remoteCompactionState.modelKey === modelKey(model)) {
+        payloadObj.input = normalizeResponseItemsForPrompt(remoteCompactionState.explicitHistory, model) as unknown[];
+        delete payloadObj.previous_response_id;
+      } else if (typeof payloadObj.previous_response_id === "string") {
+        if (
+          continuationState?.transport !== "websocket" &&
           continuationState?.modelKey === modelKey(model) &&
+          payloadObj.previous_response_id === continuationState.responseId &&
           typeof continuationState.contextLength === "number" &&
           continuationState.contextLength > 0
         ) {
-          const newMessages = context.messages.slice(continuationState.contextLength);
-          if (newMessages.length > 0) {
-            payloadObj.input = convertMessagesToInputItems(newMessages, model) as unknown[];
-            nextPayload = payloadObj;
-          }
+          payloadObj.input = convertMessagesToInputItems(context.messages.slice(continuationState.contextLength), model);
+        } else {
+          delete payloadObj.previous_response_id;
+          payloadObj.input = buildFullInput(context, model);
         }
       }
-      const chained = await originalOnPayload?.(nextPayload, payloadModel);
-      return chained ?? nextPayload;
+      return payloadObj;
     },
   } satisfies SimpleStreamOptions | undefined;
   const httpStream = streamSimpleOpenAIResponses(model, normalizeContext(context), mergedOptions);
@@ -848,28 +848,21 @@ export function createOpenAIWebSocketStreamFn(
             lastContextLength: 0,
             lastRequestKey: undefined,
             warmUpAttempted: false,
-            broken: false,
           };
           wsRegistry.set(sessionId, session);
         }
 
-        if (!session.manager.isConnected() && !session.broken) {
+        if (!session.manager.isConnected()) {
           try {
             await session.manager.connect(apiKey);
           } catch (error) {
-            try {
-              session.manager.close();
-            } catch {
-              // ignore
-            }
-            session.broken = true;
-            wsRegistry.delete(sessionId);
+            releaseWsSession(sessionId);
             if (transport === "websocket") throw error;
             return await fallbackToHttpResponses(model, context, options, eventStream);
           }
         }
 
-        if (session.broken || !session.manager.isConnected()) {
+        if (!session.manager.isConnected()) {
           if (transport === "websocket") {
             throw new Error("WebSocket session disconnected");
           }
@@ -1010,6 +1003,7 @@ export function createOpenAIWebSocketStreamFn(
               );
               setContinuationState(sessionId, {
                 responseId: response.id,
+                transport: "websocket",
                 modelKey: currentModelKey,
                 updatedAt: Date.now(),
                 contextLength: capturedContextLength,
