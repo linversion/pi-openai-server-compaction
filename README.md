@@ -50,11 +50,9 @@ https://x.com/alexisgallagher/status/2042396986327060736?s=20 .)
 | `openai-codex/*`      | Yes                         | No (built-in transport retained)  | No (built-in transport retained) | Yes         |
 | Azure                 | Partial (opt-in via config) | Partial                           | No                               | No          |
 
-Remote compaction also depends on the authentication channel's capabilities. In
-the October 2026 Luna validation, direct OpenAI subscription-sharing OAuth
-accepted ordinary text and tools but rejected `compaction_trigger`; the Codex
-subscription backend completed the remote lifecycle. See [validation](VALIDATION.md)
-for the separate results. A successful portable text summary is not evidence
+Remote compaction also depends on the authentication channel's capabilities.
+See [validation](VALIDATION.md) for channel-specific results and limitations.
+A successful portable text summary is not evidence
 that a remote artifact was produced.
 
 ## Install
@@ -95,13 +93,14 @@ On compaction, the extension requests Responses compaction v2 through `/v1/respo
 
 For direct `openai/*` models between compactions, the extension also:
 
-- Adds `context_management` for HTTP requests and defaults unspecified `store` to `true`; preserves an explicit `store: false`
+- Adds `context_management` for HTTP requests, with storage behavior described under [Data handling](#data-handling)
 - Uses `previous_response_id` for live continuation when safe
 - Provides a WebSocket-backed transport path with HTTP fallback
 
-The WebSocket send boundary enforces `store: false` and removes the HTTP
-`context_management` patch after payload hooks. Continuation IDs are scoped to
-the current socket. A rejected ID is retried once on a fresh socket with full
+The WebSocket send boundary enforces the [storage policy](#data-handling) and removes the HTTP
+`context_management` patch after payload hooks. WebSocket continuation IDs are scoped to
+the current socket and are excluded from HTTP fallback, which can still use valid
+HTTP continuation IDs. A rejected WebSocket ID is retried once on a fresh socket with full
 history, only before output begins; partial text or tool output is never replayed.
 
 For `openai-codex/*` models, the extension preserves the built-in Codex transport and only injects reconstructed remote compaction history after compaction boundaries.

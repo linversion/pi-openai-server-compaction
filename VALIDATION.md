@@ -69,7 +69,8 @@ channel accepts triggers or that the custom WebSocket path has passed a remote
 compaction boundary on that channel.
 
 **Automated regression checks:** `npm test` passes typechecking, smoke tests,
-eight output/context checks and ten local WebSocket continuation scenarios.
+the output/context checks in `scripts/websocket-regression.mjs` and the local
+continuation scenarios in `scripts/websocket-continuation-regression.mjs`.
 These cover explicit no-store handling, streamed text/tool item recovery,
 nested errors, modern/legacy context adaptation, warmup input, same-socket
 continuation, explicit/automatic reconnect, rejected-ID recovery with and without
@@ -82,9 +83,9 @@ the repair. Local fixtures do not substitute for the separate live results above
 Azure, maximum reasoning effort, a full Pi 1.x SDK migration, and direct-provider
 post-remote-compaction continuity were not validated by this repair.
 
-## Current Responses compaction v2 validation
+## Earlier Responses compaction v2 validation
 
-The full live Pi RPC suite passes with both:
+The earlier full live Pi RPC suite passed with both:
 
 - `openai/gpt-5.6-luna` through the direct OpenAI Responses API
 - `openai-codex/gpt-5.6-sol` through the ChatGPT Codex subscription backend
