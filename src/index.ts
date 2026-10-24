@@ -313,7 +313,9 @@ export default function openaiServerCompactionExtension(pi: ExtensionAPI) {
       transport: previous?.responseId === responseId ? previous.transport : "http",
       modelKey: modelKey(model),
       updatedAt: Date.now(),
-      contextLength: getBranchMessageCount(ctx.sessionManager.getBranch() as BranchEntry[]),
+      // Pi emits message_end before appending this assistant to the branch.
+      // The response ID already represents its output, so skip it on continuation.
+      contextLength: getBranchMessageCount(ctx.sessionManager.getBranch() as BranchEntry[]) + 1,
     });
   });
 

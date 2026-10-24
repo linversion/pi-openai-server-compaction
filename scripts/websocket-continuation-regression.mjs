@@ -32,11 +32,18 @@ async function scenario(name) {
     for await (const chunk of request) body += chunk;
     httpRequests.push(JSON.parse(body));
     response.writeHead(200, { "content-type": "text/event-stream" });
+    const output = { type: "message", id: "msg_http", role: "assistant",
+      content: [{ type: "output_text", text: "HTTP_OK", annotations: [] }] };
     const completed = { type: "response.completed", response: {
-      id: "resp_http", status: "completed", output: [],
+      id: "resp_http", status: "completed", output: [output],
       usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
     } };
-    response.end(`event: response.completed\ndata: ${JSON.stringify(completed)}\n\n`);
+    response.end([
+      { type: "response.output_item.added", output_index: 0, item: { ...output, content: [] } },
+      { type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "HTTP_OK" },
+      { type: "response.output_item.done", output_index: 0, item: output },
+      completed,
+    ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""));
   });
   await new Promise((resolve) => httpServer.listen(0, "127.0.0.1", resolve));
   let handshakes = 0;
@@ -134,7 +141,8 @@ async function scenario(name) {
     assert.equal(first.stopReason, name === "tool" ? "toolUse" : "stop");
     const ctx = { cwd: process.cwd(), model, hasUI: false, sessionManager: {
       getSessionId: () => sessionId,
-      getBranch: () => [...messages, first].map((message) => ({ type: "message", message })),
+      // Pi emits message_end to extensions before persisting the assistant.
+      getBranch: () => messages.map((message) => ({ type: "message", message })),
     } };
     handlers.get("message_end")({ message: first }, ctx);
     assert.equal(getContinuationState(sessionId)?.transport, httpOnly ? "http" : "websocket");
@@ -219,4 +227,5 @@ async function scenario(name) {
   }
 }
 for (const name of ["idle-http", "sse-switch", "sse-switch-stale-hook", "sse-switch-mutating-stale-hook", "http-continuation", "http-continuation-empty", "healthy", "tool", "empty", "warmup", "expired-http-fallback", "explicit-reconnect", "auto-reconnect", "expired", "expired-close",
-  "expired-code", "expired-after-text", "expired-after-tool-start", "retry-fails"]) await scenario(name);
+  "expired-code", "expired-after-text", "expired-after-tool-start", "retry-fails"]
+  .filter((name) => !process.argv[2] || name === process.argv[2])) await scenario(name);
